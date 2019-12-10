@@ -1,0 +1,542 @@
+---
+title: "NYC Project Report"
+author: "Kelsey Blackstone"
+date: "12/09/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+library(useful)
+library(magrittr)
+library(dygraphs)
+library(xgboost)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(inspectdf)
+library(caret)
+library(ranger)
+library(knitr)
+library(kableExtra)
+
+
+setwd("~/Documents/STAT 204/Project")
+dataTest <- read_csv("manhattan_Test.csv")
+dataTrain <- read_csv("manhattan_Train.csv")
+dataVal <- read_csv("manhattan_Validate.csv")
+data <- rbind(dataTest,dataTrain,dataVal) %>%
+        mutate(Council = as.character(Council),
+               PolicePrct = as.character(PolicePrct))
+#dat <- dat %>% subset(TotalValue < quantile(dat$TotalValue, prob = 0.90))
+```
+
+## Data Cleaning
+
+Refactoring categorical variables and dropping columns we don't want.
+
+
+```{r}
+data <- data %>% mutate(Class2 = ifelse(grepl("apartment|loft|condo|family", tolower(Class)), "apartment/home", 
+                                ifelse(grepl("office|retail|hotel|theatre", tolower(Class)), "business",
+                                ifelse(grepl("utility|government|transport|health|asylum|education", tolower(Class)),   "utility","misc")))) %>%
+  mutate(Built2 = ifelse(grepl("18th", Built), "18th Century",
+                  ifelse(grepl("Unknown", Built), "Unknown", "20th Century"))) %>%
+  mutate(LandUse2 = ifelse(grepl("family", tolower(LandUse)), "residential", 
+                    ifelse(grepl("office|industrial|mixed", tolower(LandUse)), "mixed",
+                    ifelse(grepl("public", tolower(LandUse)), "public", "industrial")))) %>%
+  mutate(Council = as.character(Council),
+         PolicePrct = as.character(PolicePrct),
+         logTotalValue = log(TotalValue)) %>%
+  dplyr::select(-c("ID", "Borough", "ZoneDist2", "ZoneDist3", "ZoneDist4", "Easements",
+                   "GarageArea", "StrgeArea", "FactryArea", "OtherArea", "LotFront", "LotDepth", "BldgFront", "BldgDepth",
+                   "Extension", "Proximity", "BasementType",
+                   "BuiltFAR", "ResidFAR", "CommFAR", "FacilFAR", "High",
+                   "Built", "Class", "TotalValue", "LandUse"))
+
+```
+
+## Fitting a lm and choosing significant variables
+
+- Lots of variables are significant from the F-tests in the Anova, but we need to adjust for multiple testing
+
+```{r}
+lm1 <- lm(data = data, logTotalValue ~ .)
+anova(lm1)
+```
+
+- Adjusting for multiple testing with FDR and BH 
+<https://benwhalley.github.io/just-enough-r/multiple-comparisons.html>
+
+```{r}
+
+summary(lm1) %>% broom::tidy() %>%
+  mutate(p.fdr = p.adjust(p.value, method="fdr"),
+         p.bh = p.adjust(p.value, method="hochberg"),
+         p.sig = ifelse(p.value < .05, "*", ""),
+         p.fdr.sig = ifelse(p.fdr < .05, "*", ""),
+         p.bh.sig = ifelse(p.bh < .05, "*", "")) %>%
+  dplyr::select(-c("estimate", "std.error", "statistic"))
+```
+
+- We can go through this and write out equations for new linear models based of what FDR and BH find significant. This is at the factor level, so we will have to see which variables we put into the lm formula. 
+
+## Principal Component Analysis on the Dimension Data
+
+Drop the original dimension variables and join in the first 2 principal components.
+
+```{r}
+library(ggcorrplot)
+man_sub = subset(data, select = c(LotArea, BldgArea, ComArea, ResArea, OfficeArea, RetailArea, NumFloors, UnitsRes, NumBldgs, UnitsTotal))
+
+man_sub2 = dplyr::select(data, c(LotArea, BldgArea, ComArea, ResArea, OfficeArea, RetailArea, NumFloors, UnitsRes,
+                                  NumBldgs, UnitsTotal))
+ggcorrplot(round(cor(man_sub2),1), lab = TRUE, type = "lower", hc.order = TRUE)
+manhat_pc2 = prcomp(man_sub)
+manhat_pc2
+summary(manhat_pc2)
+manhat2.pc = predict(manhat_pc2)
+
+data2 <- data %>% dplyr::select(-c(ResArea, RetailArea, NumFloors, UnitsRes, NumBldgs, UnitsTotal)) #%>%
+  #mutate(pc1 = manhat2.pc[,1],
+  #       pc2 = manhat2.pc[,2]) %>%
+  #dplyr::select(c(1:18,20:21,19)) # make the response the last column as well to make things easier later
+```
+
+
+## Fitting Ridge Regression Models with glmnet package
+
+<https://www.rstatisticsblog.com/data-science-in-action/lasso-regression/>.
+<https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html>.
+
+We need to build a sparse model matrix that has columns for all factor levels seen in both the training and test set, there were prediction errors otherwise. 
+
+```{r}
+library(glmnet)
+library(glmnetUtils)
+
+data2 <- data2 %>% na.omit() %>%
+  mutate_if(sapply(data2, is.character), as.factor)
+
+set.seed(112358)
+smp_size <- floor(0.75 * nrow(data2))
+train_ind <- sample(seq_len(nrow(data2)), size = smp_size)
+train <- data2[train_ind, ] # 30K rows
+test <- data2[-train_ind, ] 
+
+
+traintest=rbind(train,test)
+X = sparse.model.matrix(as.formula(paste("logTotalValue ~", 
+                                         paste(colnames(train[,-ncol(train)]), sep = "", collapse=" +"))), 
+                        data = traintest)
+X = data.matrix(traintest)
+```
+
+Now that we have the appropraite training and test sets, we can fit the models. We will do this with both $glmnet()$ and $cv.glmnet()$. For $glmnet()$, we give it a vector of $\lambda$ values to try and we can then see the impact of lambda on the parameter coefficients and the fraction of deviance explained. 
+
+In the following 2 plots, we see that several of the parameters are handled similarly by Lasso and Ridge. In particular, we note that variables 18 and 15 are given the highest parameter values in both models. We also see the parameters 4 and 6 are assigned very small coefficients in both models. 
+
+```{r}
+lambda_seq <- 10^seq(2, -2, by = -.1)
+ncol(train)-1
+ridge1 <- glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 0, lambda = lambda_seq)
+plot(ridge1, label = TRUE, xvar = "dev")
+```
+
+```{r}
+lasso1 <- glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 1, lambda = lambda_seq)
+plot(lasso1, label = TRUE, main = "Lasso Regression Coefs")
+```
+
+```{r}
+ridge.cv <- cv.glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 0)
+ridge.cv$lambda.min
+lasso.cv = cv.glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 1)
+lasso.cv$lambda.min
+```
+
+```{r}
+lasso.cv.lambda.1se <- glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 1, lambda = lasso.cv$lambda.1se)
+#plot(lasso2, label = TRUE, main = "Lasso Regression Coefs")
+lasso.cv.lambda.1se.pred = predict(lasso.cv.lambda.1se, newx=X[nrow(train):nrow(X),1:(ncol(train)-1)], type="response")
+lasso.cv.lambda.1se.rss <- sum((lasso.cv.lambda.1se.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lasso.cv.lambda.1se.r.squared <- 1 - lasso.cv.lambda.1se.rss/tss
+lasso.cv.lambda.1se.r.squared
+
+
+lasso.cv.lambda.min <- glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 0, lambda = lasso.cv$lambda.min)
+lasso.cv.lambda.min.pred = predict(lasso.cv.lambda.min, newx=X[nrow(train):nrow(X),1:(ncol(train)-1)], type="response")
+lasso.cv.lambda.min.rss <- sum((lasso.cv.lambda.min.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lasso.cv.lambda.min.r.squared <- 1 - lasso.cv.lambda.min.rss/tss
+lasso.cv.lambda.min.r.squared
+
+
+lasso.lambda.mean = 0.5*(lasso.cv$lambda.min + lasso.cv$lambda.1se)
+
+lasso.cv.lambda.mean <- glmnet(X[1:nrow(train),1:(ncol(train)-1)], X[1:nrow(train),ncol(train)], alpha = 0, lambda = lasso.lambda.mean)
+#plot(lasso2, label = TRUE, main = "Lasso Regression Coefs")
+lasso.cv.lambda.mean.pred = predict(lasso.cv.lambda.mean, newx=X[nrow(train):nrow(X),1:(ncol(train)-1)], type="response")
+lasso.cv.lambda.mean.rss <- sum((lasso.cv.lambda.mean.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lasso.cv.lambda.mean.r.squared <- 1 - lasso.cv.lambda.mean.rss/tss
+lasso.cv.lambda.mean.r.squared
+```
+
+
+```{r}
+lasso1 <- glmnet(X[1:nrow(train),1:ncol(train)-1], X[1:nrow(train),ncol(train)], alpha = 1, lambda = lambda_seq)
+plot(lasso1, label = TRUE)
+```
+
+Next, we use cross-validation to select the optimal level of lambda in both for both Lasso and Ridge Regression, noting that their respecive values of $\lambda$ are quite different, which makes perfect sense, since they are realted to different penalty terms..
+
+
+
+We also return the coefficients from both of the cross-validated models. Note that there are similarities in the coefficients, but that lasso does let set some coefficients = 0. We will put these in a table. We also note the these models do not return interval estimates for these parameters - just point predictions.
+
+
+Now we predict our Ridge model on the out of sample test set and compute the RSS (residual sum of squares) and the $R^2$ manually. I was unable to compute the test set AIC, I am not sure why extractAIC() does not work on a glmnet() model. We see the test set $R^2 = 0.533$
+
+```{r}
+ridge.cv.lambda.1se <- glmnet(X[1:nrow(train),1:ncol(train)-1], X[1:nrow(train),ncol(train)], alpha = 0, lambda = ridge.cv$lambda.1se)
+#plot(lasso2, label = TRUE, main = "Lasso Regression Coefs")
+ridge.cv.lambda.1se.pred = predict(ridge.cv.lambda.1se, newx=X[nrow(train):nrow(X),1:ncol(train)-1], type="response")
+ridge.cv.lambda.1se.rss <- sum((ridge.cv.lambda.1se.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+ridge.cv.lambda.1se.r.squared <- 1 - ridge.cv.lambda.1se.rss/tss
+ridge.cv.lambda.1se.r.squared
+
+
+
+ridge.cv.lambda.min <- glmnet(X[1:nrow(train),1:ncol(train)-1], X[1:nrow(train),ncol(train)], alpha = 0, lambda = ridge.cv$lambda.min)
+#plot(lasso2, label = TRUE, main = "Lasso Regression Coefs")
+ridge.cv.lambda.min.pred = predict(ridge.cv.lambda.min, newx=X[nrow(train):nrow(X),1:ncol(train)-1], type="response")
+ridge.cv.lambda.min.rss <- sum((ridge.cv.lambda.min.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+ridge.cv.lambda.min.r.squared <- 1 - ridge.cv.lambda.min.rss/tss
+ridge.cv.lambda.min.r.squared
+
+ridge.lambda.mean = 0.5*(ridge.cv$lambda.min + ridge.cv$lambda.1se)
+
+ridge.cv.lambda.mean <- glmnet(X[1:nrow(train),1:ncol(train)-1], X[1:nrow(train),ncol(train)], alpha = 0, lambda = ridge.lambda.mean)
+#plot(lasso2, label = TRUE, main = "Lasso Regression Coefs")
+ridge.cv.lambda.mean.pred = predict(ridge.cv.lambda.mean, newx=X[nrow(train):nrow(X),1:ncol(train)-1], type="response")
+ridge.cv.lambda.mean.rss <- sum((ridge.cv.lambda.mean.pred - X[nrow(train):nrow(X),ncol(train)]) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+ridge.cv.lambda.mean.r.squared <- 1 - ridge.cv.lambda.mean.rss/tss
+ridge.cv.lambda.mean.r.squared
+
+```
+ 
+We also plot the cv.glmnet() object. The dotted line is our lambda.min.
+
+```{r}
+plot(ridge.cv)
+```
+
+Now the same for the Lasso Model.
+
+```{r}
+plot(lasso.cv)
+lasso.cv.pred = predict(lasso.cv, s='lambda.min', newx=X[nrow(train):nrow(X),1:ncol(train)-1], type="response")
+```
+
+The Lasso Model has a slightly higher test-set $R^2$.
+
+## Fitting a lm() with the variables selected by Lasso
+
+She mentioned in class that this is common practice. Look at $coef(lasso.cv)$ and throw the non-zero parameters into the formula for lm(). We see that this produces a significantly higher out of sample $R^2$, which is an interesting finding. We can also get the AIC from this fit model.
+
+```{r}
+coef(lasso.cv.lambda.1se)
+lm.lasso <- lm(data = train, 
+               logTotalValue ~ SchoolDistrict + Council + FireService + PolicePrct + ZoneDist1 + LotArea + BldgArea +  LotType + Built2 + LandUse2)
+
+lm.lasso.pred <- predict(lm.lasso, newdata = test)
+lm.lasso.rss <- sum((lm.lasso.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lm.lasso.r.squared <- 1 - lm.lasso.rss/tss
+lm.lasso.r.squared
+extractAIC(lm.lasso)
+```
+
+We can compare this to a full linear model with no variable selection done and the null model, with only the intercept. We notice that this full model has a slightly higher test set $R^2$ and a slightly higher training set AIC. This is interesting. I think we need more out of sample error metrics here.
+
+```{r}
+lm.full <- lm(data = train, logTotalValue ~ .)
+
+summary(lm.full) %>% broom::tidy() %>%
+  mutate(p.fdr = p.adjust(p.value, method="fdr"),
+         p.bh = p.adjust(p.value, method="hochberg"),
+         p.sig = ifelse(p.value < .05, "*", ""),
+         p.fdr.sig = ifelse(p.fdr < .05, "*", ""),
+         p.bh.sig = ifelse(p.bh < .05, "*", "")) %>%
+  dplyr::select(-c("estimate", "std.error", "statistic"))
+
+lm.full.pred <- predict(lm.full, newdata = test)
+
+lm.full.rss <- sum((lm.full.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lm.full.r.squared <- 1 - lm.full.rss/tss
+lm.full.r.squared
+extractAIC(lm.full)
+
+
+lm.bh <- lm(data = train, logTotalValue ~ . -HealthArea -OfficeArea -Landmark)
+
+lm.bh.pred <- predict(lm.bh, newdata = test)
+
+lm.bh.rss <- sum((lm.bh.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lm.bh.r.squared <- 1 - lm.bh.rss/tss
+lm.bh.r.squared
+extractAIC(lm.full)
+```
+
+
+
+```{r}
+lm.null <- lm(data = train, logTotalValue ~ 1)
+
+lm.null.pred <- predict(lm.null, newdata = test)
+
+lm.null.rss <- sum((lm.null.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+lm.null.r.squared <- 1 - lm.null.rss/tss
+lm.null.r.squared
+extractAIC(lm.null)
+```
+
+## XGBOOST
+
+```{r}
+library(useful)
+library(magrittr)
+library(dygraphs)
+library(xgboost)
+library(DiagrammeR)
+#############################
+# I am giving XGBoost only the values selected by the LASSO model. 
+# same formula as the lm.lasso 
+histFormula <- logTotalValue ~ SchoolDistrict + Council + FireService + PolicePrct + ZoneDist1 + LandUse2 + OwnerType + IrregularLot + LotType + Landmark + Class2 + Built2 + BldgArea - 1
+
+landx_train <- build.x(histFormula, data=train, 
+                       contrasts=FALSE, sparse=TRUE)
+landy_train <- build.y(histFormula, data=train) #%>% 
+   # as.factor() %>% as.integer() - 1
+
+
+landx_test <- build.x(histFormula, data=test, 
+                       contrasts=FALSE, sparse=TRUE)
+landy_test <- build.y(histFormula, data=test) #%>% 
+    #as.factor() %>% as.integer() - 1
+```
+
+```{r}
+xgTrain <- xgb.DMatrix(data=landx_train, label=landy_train)
+xgTest <- xgb.DMatrix(data=landx_test, label=landy_test)
+#xgVal <- xgb.DMatrix(data=landx_val, label=landy_val)
+
+hist1 <- xgb.train(
+    data=xgTrain,
+    objective="reg:linear",
+    nrounds=500
+)
+
+xgb.plot.multi.trees(hist1, feature_names=colnames(landx_train), fill = TRUE)
+
+hist1 %>% 
+    xgb.importance(feature_names=colnames(landx_train)) %>% 
+    head(20) %>% 
+    xgb.plot.importance()
+
+```
+
+```{r}
+xg1.pred <- predict(hist1, newdata=xgTest)
+
+xg1.rss <- sum((xg1.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+xg1.r.squared <- 1 - xg1.rss/tss
+xg1.rss
+xg1.r.squared
+
+```
+
+```{r}
+system.time(hist2 <- xgb.train(
+    data=xgTrain,
+    objective="reg:linear",
+    nrounds=1500
+))
+
+xgb.plot.multi.trees(hist1, feature_names=colnames(landx_train), fill = TRUE)
+
+hist2 %>% 
+    xgb.importance(feature_names=colnames(landx_train)) %>% 
+    head(20) %>% 
+    xgb.plot.importance()
+
+xg2.pred <- predict(hist2, newdata=xgTest)
+
+rss <- sum((xg2.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+r.squared <- 1 - rss/tss
+rss
+r.squared
+```
+
+```{r}
+system.time(hist3 <- xgb.train(
+    data=xgTrain,
+    objective="reg:linear",
+    eval_metric='mlogloss',
+    nrounds=500
+))
+
+xgb.plot.multi.trees(hist3, feature_names=colnames(landx_train), fill = TRUE)
+
+hist3 %>% 
+    xgb.importance(feature_names=colnames(landx_train)) %>% 
+    head(20) %>% 
+    xgb.plot.importance()
+
+xg3.pred <- predict(hist3, newdata=xgTest)
+
+rss <- sum((xg3.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+r.squared <- 1 - rss/tss
+rss
+r.squared
+```
+
+
+## Neighborhood only linear model
+
+
+```{r}
+train2 <- train %>% mutate(hood = paste(SchoolDistrict, Council, PolicePrct, sep = ":"))
+test2 <- test %>% mutate(hood = paste(SchoolDistrict, Council, PolicePrct, sep = ":"))
+
+hood.lm <- lm(data = train2, logTotalValue ~ hood)
+hood.lm.pred <- predict(hood.lm, newdata = test2)
+hood.lm.rss <- sum((hood.lm.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+hood.lm.r.squared <- 1 - hood.lm.rss/tss
+hood.lm.r.squared
+
+```
+
+
+
+```{r}
+models <- c("LM - NULL", "LM - FULL", "LM - B.H.", "LM - LASSO", "LM - Hood",
+            "LASSO.cv.lambda.1se", "LASSO.cv.lambda.min", "LASSO.cv.lambda.mean",
+            "RIDGE.cv.lambda.1se", "RIDGE.cv.lambda.min", "RIDGE.cv.lambda.mean",
+            "XGBOOST")
+
+metric <- c(rep("AIC", 5), rep("Dev Ratio", 6), "?")
+
+train_metric <- c(extractAIC(lm.null)[2], extractAIC(lm.full)[2], extractAIC(lm.bh)[2], 
+                  extractAIC(lm.lasso)[2], extractAIC(hood.lm)[2],
+                  lasso.cv.lambda.1se$dev.ratio, lasso.cv.lambda.min$dev.ratio, lasso.cv.lambda.mean$dev.ratio,
+                  ridge.cv.lambda.1se$dev.ratio, ridge.cv.lambda.min$dev.ratio, ridge.cv.lambda.mean$dev.ratio,
+                  0)
+
+test_r_squared <- c(lm.null.r.squared, lm.full.r.squared, lm.bh.r.squared, lm.lasso.r.squared, hood.lm.r.squared,
+                    lasso.cv.lambda.1se.r.squared, lasso.cv.lambda.min.r.squared, lasso.cv.lambda.mean.r.squared,
+                    ridge.cv.lambda.1se.r.squared, ridge.cv.lambda.min.r.squared, ridge.cv.lambda.mean.r.squared,
+                    xg1.r.squared)
+
+
+df <- data.frame(models, metric, train_metric, test_r_squared) %>% mutate(train_metric = round(train_metric, 3))
+df[12,3] = "?"
+kable(df, caption = "Model Comparison", colnames = c("Model", "Training Metric", "Train Metric Value", "Test R^2")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                latex_options = "HOLD_position")
+```
+
+
+booster="gbtree"
+
+## Comparing Ridge and Lasso Coefficients
+
+```{r, warning = FALSE}
+coef(ridge.cv) %>% broom::tidy() %>% left_join(broom::tidy(coef(lasso.cv)), by = "row") %>%
+  mutate(value.x = round(value.x, 4),
+         value.y = round(value.y, 4)) %>%
+  dplyr::select(1, "C.V. Ridge Coefficient" = 3, "C.V. Lasso Coefficient" = 5) %>%
+  kable(caption = "Comparing Coefficeints from C.V. Ridge and Lasso models")  %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                latex_options = "HOLD_position")
+```
+
+## Comparing ANOVA tables
+
+```{r}
+anova(lm.bh) %>% broom::tidy() %>% dplyr::select(1,5,6) %>%
+  left_join(broom::tidy(anova(lm.lasso)), by = "term") %>%
+  dplyr::select(1:3,7,8) %>%
+  mutate(statistic.x = round(statistic.x, 3),
+         p.value.x = round(p.value.x, 5),
+         statistic.y = round(statistic.y, 3),
+         p.value.y = round(p.value.y, 5)) %>%
+  arrange(desc(statistic.x)) %>%
+  dplyr::select("Predictor" = 1, "LM-BH F-Stat" = 2, "LM-BH p-value" = 3,
+                "LM-Lasso F Stat" = 4, "LM-Lasso p-value" = 5) %>%
+  kable(caption = "Comparing ANOVAs for LM-BH and LM-Lasso")  %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                latex_options = "HOLD_position") %>% xtable()
+
+# can join in lm.bh as well
+anova(lm.bh) %>% broom::tidy() %>% dplyr::select(1,5,6) %>%
+  full_join(broom::tidy(anova(lm.lasso)), by = "term") %>%
+  dplyr::select(1:3,7,8) %>%
+  mutate(statistic.x = round(statistic.x, 3),
+         p.value.x = round(p.value.x, 5),
+         statistic.y = round(statistic.y, 3),
+         p.value.y = round(p.value.y, 5)) %>%
+  arrange(desc(statistic.x)) %>%
+  dplyr::select("Predictor" = 1, "LM-BH F-Stat" = 2, "LM-BH p-value" = 3,
+                "LM-Lasso F Stat" = 4, "LM-Lasso p-value" = 5) %>% xtable()
+
+```
+
+```{r}
+broom::tidy(summary(lm.bh)) %>% 
+  full_join(broom::tidy(summary(lm.lasso)), by = "term") %>%
+  filter(abs(estimate.x) > 1 | abs(estimate.y) > 1) %>%
+  dplyr::select("Variable" = 1, "LM-BH Coef" = 2, "LM-BH p-value" = 5, "LM-Lasso Coef" = 6,
+                 "LM-Lasso p-value" = 9) %>%
+  xtable()
+```
+
+```{r}
+lm.xg <- lm(data = train, logTotalValue ~ BldgArea)
+
+lm.xg.pred <- predict(lm.xg, newdata=test)
+
+rss <- sum((lm.xg.pred - test$logTotalValue) ^ 2)
+tss <- sum((X[nrow(train):nrow(X),ncol(train)] - mean(X[nrow(train):nrow(X),ncol(train)])) ^ 2)
+r.squared <- 1 - rss/tss
+rss
+r.squared
+```
+
+# Checking Model Assumptions of Final Mode: LM.LASSO
+```{r}
+plot(lm.lasso, sub.caption = " ")
+```
+
+
+## Fitting a Bayesian Model
+- I havent done this before but we can follow this example
+<https://benwhalley.github.io/just-enough-r/bayes-mcmc.html#bayes-mcmc>.
